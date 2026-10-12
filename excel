@@ -58,9 +58,7 @@ def znajdz_etykiete(ws, nazwa):
  
 def jest_etykieta(v):
     """Tekst, który nie jest liczbą (np. 'KOSZTY') – początek pola sąsiada."""
-    return v is not None and str(v).strip() != "" and na_liczbe(v) is None
- 
- 
+    return v is not None and str(v).strip() != "" and na_liczbe(v) is None 
 def kwota_obok(ws, r, k):
     """Pierwsza liczba na prawo od etykiety w tym samym wierszu, ale przed następną
     etykietą – dalej są już kwoty innego pola (ZDROW. w J17 -> kwota w M17).
@@ -75,8 +73,6 @@ def kwota_obok(ws, r, k):
             if jest_etykieta(v):
                 break
     return None
- 
- 
 def tekst_obok(ws, r, k):
     """Pierwsza niepusta komórka na prawo od etykiety, jako tekst. Tekst zakończony
     dwukropkiem to już następna etykieta (np. 'Tytuł ubezpieczenia:') – wtedy None."""
@@ -88,8 +84,6 @@ def tekst_obok(ws, r, k):
             tekst = str(v).strip()
             return None if tekst.endswith(":") else tekst
     return None
- 
- 
 def pole_tekstowe(ws, nazwa, gdzie):
     """Szuka etykiety tylko w kolumnie A. Wartość to tekst po etykiecie w tej samej
     komórce ('Pracownik: Jan Kowalski' -> 'Jan Kowalski'); dla pól "obok", gdy w komórce
@@ -106,8 +100,6 @@ def pole_tekstowe(ws, nazwa, gdzie):
             return po.strip()
         return tekst_obok(ws, c.row, c.column) if gdzie == "obok" else None
     return None
- 
- 
 def wczytaj_pola(ws):
     """{'PRACOWNIK': 'Jan Kowalski', 'PESEL': '...', 'PODST. ZDROW': Decimal, ...};
     pole, którego nie znaleziono, ma wartość None."""
@@ -125,4 +117,3 @@ def wczytaj_pola(ws):
             wartosc = na_liczbe(w_komorce) if w_komorce else kwota_obok(ws, komorka.row, komorka.column)
         pola[etykieta(nazwa)] = wartosc
     return pola
- 
