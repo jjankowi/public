@@ -1,253 +1,128 @@
+POLA_KWOT = ("PODST. ZDROW.", "ZDROW.", "ZAL. POD.", "KOSZTY", "ULGA POD.", "GOT", "ROR")
+POLA_TEKSTU = {"PRACOWNIK": "w_komorce", "PESEL": "obok"}
 
-import re
-import sys
-from decimal import Decimal
- 
-from openpyxl import load_workbook
-from openpyxl.utils import column_index_from_string, get_column_letter
- 
-# ------------------------------------------------------------------ ustawienia
-# Gdyby automatyczne wykrywanie kolumn sekcji zawiodło, wpisz zakresy ręcznie, np.:
-# RECZNE_ZAKRESY = {"opodatkowane": ("I", "L"), "nieopodatkowane": ("M", "P")}
-RECZNE_ZAKRESY = None
- 
-# Wiersz bez nazwy albo zaczynający się od tych słów kończy listę składników
-SLOWA_KONCZACE = ("RAZEM", "SUMA", "OGÓŁEM", "ŁĄCZNIE")
- 
-# Wiersze tabeli składek do wczytania (porównywane bez polskich znaków)
-WIERSZE_ZUS = ("PODSTAWA", "UBEZPIECZ", "PLATNIK")
- 
-# O ile kolumn kwota w tabeli składek może odjechać od swojego nagłówka
-MAKS_PRZESUNIECIE = 2
- 
- 
-# ------------------------------------------------------------------- narzędzia
-def normalizuj(tekst):
-    """'Nieopodatkowane:' -> 'NIEOPODATKOWANE' (same wielkie litery)."""
-    return re.sub(r"[^A-ZĄĆĘŁŃÓŚŹŻ]", "", str(tekst).upper())
- 
- 
-def bez_ogonkow(tekst):
-    """'Płatnik:' -> 'PLATNIK' – porównanie działa też, gdy w pliku brak polskich znaków."""
-    return normalizuj(tekst).translate(str.maketrans("ĄĆĘŁŃÓŚŹŻ", "ACELNOSZZ"))
- 
- 
-def etykieta(tekst):
-    """'UBEZPIECZ.:' -> 'UBEZPIECZ' – czysta nazwa na klucz słownika."""
-    return str(tekst).strip().rstrip(".: ")
- 
- 
-def na_liczbe(wartosc):
-    """609.32 / '5 280,00' / '1.234,56 zł' -> Decimal, wszystko inne -> None."""
-    if wartosc is None or isinstance(wartosc, bool):
-        return None
-    if isinstance(wartosc, (int, float)):
-        return Decimal(str(wartosc))
-    if isinstance(wartosc, str):
-        # \s usuwa też twardą spację, którą programy płacowe wstawiają między tysiące
-        s = re.sub(r"\s|zł|pln", "", wartosc, flags=re.IGNORECASE)
-        if "," in s:  # zapis polski: kropka = tysiące, przecinek = grosze
-            s = s.replace(".", "").replace(",", ".")
-        if re.fullmatch(r"-?\d+(\.\d+)?", s):
-            return Decimal(s)
-    return None
- 
- 
-def pierwszy_tekst(ws, wiersz, od_kol, do_kol):
-    """(kolumna, tekst) pierwszej komórki z tekstem, który nie jest liczbą – albo (None, None)."""
-    for k in range(od_kol, do_kol + 1):
-        v = ws.cell(wiersz, k).value
-        if v is not None and str(v).strip() and na_liczbe(v) is None:
-            return k, str(v).strip()
+def pole_tekstowe(ws, nazwa, gdzie):
+    cel = bez_ogonkow(nazwa)
+    for (c,) in ws.iter_rows(min_col=1, max_col=1):        # tylko kolumna A
+        tekst = c.value.strip() if isinstance(c.value, str) else ""
+        if not tekst or not bez_ogonkow(tekst).startswith(cel):
+            continue                                        # to nie ta etykieta
+        _, dwukropek, po = tekst.partition(":")             # 'Pracownik: Jan' -> 'Jan'
+        if not dwukropek:                                   # bez dwukropka: odetnij pierwsze słowo
+            po = tekst.split(None, 1)[1] if len(tekst.split(None, 1)) > 1 else ""
+        if po.strip():
+            return po.strip()                               # wartość była w komórce
+        return tekst_obok(ws, c.row, c.column) if gdzie == "obok" else None
+    return None                                             # etykiety nie ma w kolumnie A
+
+
+for nazwa, gdzie in POLA_TEKSTU.items():
+    wartosc = pole_tekstowe(ws, nazwa, gdzie)
+    if nazwa == "PESEL" and wartosc and wartosc.isdigit():
+        wartosc = wartosc.zfill(11)
+    pola[etykieta(nazwa)] = wartosc
+
+
+def scalenie(ws, wiersz, kol):
+    """(od_wiersza, od_kol, do_wiersza, do_kol) scalenia, do którego należy komórka;
+    dla zwykłej komórki to ona sama."""
+    for z in ws.merged_cells.ranges:
+        if z.min_row <= wiersz <= z.max_row and z.min_col <= kol <= z.max_col:
+            return z.min_row, z.min_col, z.max_row, z.max_col
+    return wiersz, kol, wiersz, kol
+
+
+def zakres_komorki(ws, wiersz, kol):
+    """(od_kol, do_kol) – dla komórki scalonej cały jej zakres, dla zwykłej (kol, kol)."""
+    _, od_kol, _, do_kol = scalenie(ws, wiersz, kol)
+    return od_kol, do_kol
+
+
+
+# -------------------------------------------- część 3: pola „etykieta -> wartość”
+def znajdz_etykiete(ws, nazwa):
+    """(komórka, wartość_z_tej_samej_komórki) dla etykiety, np. 'ZAL. POD.' albo
+    'Pracownik: Jan Kowalski' (wtedy wartość to tekst po dwukropku). Brak -> (None, None)."""
+    cel = bez_ogonkow(nazwa)
+    for wiersz in ws.iter_rows():
+        for c in wiersz:
+            if not isinstance(c.value, str):
+                continue
+            przed, _, po = c.value.partition(":")
+            if po.strip() and bez_ogonkow(przed) == cel:
+                return c, po.strip()
+            if bez_ogonkow(c.value) == cel:  # dokładnie: 'ZDROW.' nie złapie 'PODST. ZDROW.'
+                return c, None
     return None, None
  
  
-def zakres_komorki(ws, wiersz, kol):
-    """(od_kol, do_kol) – dla komórki scalonej cały jej zakres, dla zwykłej (kol, kol)."""
-    for z in ws.merged_cells.ranges:
-        if z.min_row <= wiersz <= z.max_row and z.min_col <= kol <= z.max_col:
-            return z.min_col, z.max_col
-    return kol, kol
+def jest_etykieta(v):
+    """Tekst, który nie jest liczbą (np. 'KOSZTY') – początek pola sąsiada."""
+    return v is not None and str(v).strip() != "" and na_liczbe(v) is None
  
  
-def zl(kwota):
-    """Decimal('5280') -> '5 280,00'"""
-    return "" if kwota is None else f"{kwota:,.2f}".replace(",", " ").replace(".", ",")
- 
- 
-# ---------------------------------------------------- część 1: składniki płacowe
-def znajdz_naglowek(ws):
-    """Zwraca (nr_wiersza, {NAGŁÓWEK: nr_kolumny}) dla wiersza z nagłówkami sekcji."""
-    for wiersz in ws.iter_rows(max_row=min(ws.max_row, 200)):
-        naglowki = {normalizuj(c.value): c.column
-                    for c in wiersz if isinstance(c.value, str) and c.value.strip()}
-        # porównanie dokładne, bo 'NIEOPODATKOWANE' zawiera w sobie 'OPODATKOWANE'
-        if "OPODATKOWANE" in naglowki and "NIEOPODATKOWANE" in naglowki:
-            return wiersz[0].row, naglowki
-    raise ValueError("Nie znalazłem wiersza z nagłówkami OPODATKOWANE i NIEOPODATKOWANE.")
- 
- 
-def poczatek_ramki(ws, wiersz, kol, granica):
-    """Napis nagłówka nie zawsze stoi w pierwszej kolumnie swojej ramki, więc cofamy się
-    w lewo do najbliższego pionowego obramowania (ale nie dalej niż do kolumny `granica`)."""
-    for k in range(kol, granica, -1):
-        # strona obramowania bywa None (komórka ma np. tylko lewą krawędź), stąd getattr
-        lewa = getattr(ws.cell(wiersz, k).border.left, "style", None)
-        prawa_sasiada = getattr(ws.cell(wiersz, k - 1).border.right, "style", None) if k > 1 else None
-        if lewa or prawa_sasiada:
-            return k
-    return kol  # brak obramowań – sekcja zaczyna się w kolumnie nagłówka
- 
- 
-def wykryj_zakresy(ws, wiersz, naglowki):
-    """{sekcja: (od_kolumny, do_kolumny)} – numery kolumn liczone od 1."""
-    if RECZNE_ZAKRESY:
-        return {s: (column_index_from_string(a), column_index_from_string(b))
-                for s, (a, b) in RECZNE_ZAKRESY.items()}
-    k_nazwa = naglowki.get("NAZWAELEMENTU", 1)
-    k_opod, k_nieop = naglowki["OPODATKOWANE"], naglowki["NIEOPODATKOWANE"]
-    od_opod = poczatek_ramki(ws, wiersz, k_opod, k_nazwa)
-    od_nieop = poczatek_ramki(ws, wiersz, k_nieop, k_opod)
-    # NIEOPODATKOWANE sięga do następnego nagłówka po prawej albo do końca arkusza
-    dalej = [k for k in naglowki.values() if k > k_nieop]
-    do_nieop = poczatek_ramki(ws, wiersz, min(dalej), k_nieop) - 1 if dalej else ws.max_column
-    return {"opodatkowane": (od_opod, od_nieop - 1), "nieopodatkowane": (od_nieop, do_nieop)}
- 
- 
-def pierwsza_liczba(ws, wiersz, od_kol, do_kol):
-    """Pierwsza liczba w wierszu w danym zakresie kolumn – obojętnie, w której kolumnie stoi."""
-    for k in range(od_kol, do_kol + 1):
-        liczba = na_liczbe(ws.cell(wiersz, k).value)
-        if liczba is not None:
-            return liczba
+def kwota_obok(ws, r, k):
+    """Pierwsza liczba na prawo od etykiety w tym samym wierszu, ale przed następną
+    etykietą – dalej są już kwoty innego pola (ZDROW. w J17 -> kwota w M17).
+    Gdy etykieta jest scalona w pionie (np. J17:J18), sprawdza każdy jej wiersz."""
+    od_w, _, do_w, _ = scalenie(ws, r, k)
+    for rr in range(od_w, do_w + 1):
+        for kk in range(k + 1, ws.max_column + 1):
+            v = ws.cell(rr, kk).value
+            kwota = na_liczbe(v)
+            if kwota is not None:
+                return kwota
+            if jest_etykieta(v):
+                break
     return None
  
  
-def wczytaj_skladniki(ws):
-    """Zwraca (skladniki, wiersz_sumy, zakresy, nr_wiersza_nagłówków)."""
-    wiersz_nagl, naglowki = znajdz_naglowek(ws)
-    zakresy = wykryj_zakresy(ws, wiersz_nagl, naglowki)
-    od_opod = zakresy["opodatkowane"][0]
- 
-    skladniki, suma = [], None
-    for r in range(wiersz_nagl + 1, ws.max_row + 1):
-        _, nazwa = pierwszy_tekst(ws, r, 1, od_opod - 1)  # nazwa stoi na lewo od OPODATKOWANE
-        kwoty = {s: pierwsza_liczba(ws, r, od, do) for s, (od, do) in zakresy.items()}
-        sa_kwoty = any(v is not None for v in kwoty.values())
- 
-        if nazwa is None and not sa_kwoty and not skladniki:
-            continue  # puste wiersze tuż pod nagłówkiem
-        if nazwa is None or normalizuj(nazwa).startswith(SLOWA_KONCZACE):
-            suma = kwoty if sa_kwoty else None  # wiersz sumy – przyda się do kontroli
-            break
-        skladniki.append({"element": nazwa, **kwoty})
-    return skladniki, suma, zakresy, wiersz_nagl
+def tekst_obok(ws, r, k):
+    """Pierwsza niepusta komórka na prawo od etykiety, jako tekst. Tekst zakończony
+    dwukropkiem to już następna etykieta (np. 'Tytuł ubezpieczenia:') – wtedy None."""
+    for kk in range(k + 1, ws.max_column + 1):
+        v = ws.cell(r, kk).value
+        if v is not None and str(v).strip():
+            if isinstance(v, float) and v.is_integer():
+                v = int(v)
+            tekst = str(v).strip()
+            return None if tekst.endswith(":") else tekst
+    return None
  
  
-# --------------------------------------------------- część 2: tabela składek ZUS
-def przypisz_do_naglowkow(liczby, naglowki):
-    """Rozdziela kwoty z jednego wiersza między kolumny tabeli.
-    liczby:   [((od_kol, do_kol), kwota)] – posortowane od lewej
-    naglowki: [((od_kol, do_kol), nazwa)] – posortowane od lewej
-    Idąc od lewej, każda kwota trafia do najbliższego nagłówka spośród tych na prawo od
-    ostatnio użytego. Kolejność się więc zgadza, a kwota przesunięta o kolumnę nie wchodzi
-    sąsiadowi w drogę (np. CHOR. stojące w kolumnie F, choć nagłówek jest w G)."""
-    def odleglosc(a, b):  # w kolumnach; 0, gdy zakresy się nakładają
-        return max(0, b[0] - a[1], a[0] - b[1])
- 
-    wynik = {nazwa: None for _, nazwa in naglowki}
-    start = 0
-    for zakres, kwota in liczby:
-        j = min(range(start, len(naglowki)), default=None,
-                key=lambda i: odleglosc(zakres, naglowki[i][0]))
-        if j is None or odleglosc(zakres, naglowki[j][0]) > MAKS_PRZESUNIECIE:
-            print(f"Uwaga: kwota {zl(kwota)} z kolumny {get_column_letter(zakres[0])} "
-                  "nie pasuje do żadnego nagłówka - pomijam")
+def pole_tekstowe(ws, nazwa, gdzie):
+    """Szuka etykiety tylko w kolumnie A. Wartość to tekst po etykiecie w tej samej
+    komórce ('Pracownik: Jan Kowalski' -> 'Jan Kowalski'); dla pól "obok", gdy w komórce
+    jest sama etykieta, bierze pierwszą komórkę na prawo."""
+    cel = bez_ogonkow(nazwa)
+    for (c,) in ws.iter_rows(min_col=1, max_col=1):
+        tekst = c.value.strip() if isinstance(c.value, str) else ""
+        if not tekst or not bez_ogonkow(tekst).startswith(cel):
             continue
-        wynik[naglowki[j][1]] = kwota
-        start = j + 1
-    return wynik
+        _, dwukropek, po = tekst.partition(":")
+        if not dwukropek:  # bez dwukropka: 'PRACOWNIK Jan Kowalski' – odcinamy pierwsze słowo
+            po = tekst.split(None, 1)[1] if len(tekst.split(None, 1)) > 1 else ""
+        if po.strip():
+            return po.strip()
+        return tekst_obok(ws, c.row, c.column) if gdzie == "obok" else None
+    return None
  
  
-def wczytaj_zus(ws, od_wiersza=1):
-    """{'PODSTAWA': {'EMER': Decimal, ...}, 'UBEZPIECZ': {...}, 'PŁATNIK': {...}}
-    albo None, gdy w arkuszu nie ma tabeli składek."""
-    # 1) wiersz nagłówków tabeli = pierwszy wiersz, w którym są EMER. i RENT.
-    r_nagl = next((w[0].row for w in ws.iter_rows(min_row=od_wiersza)
-                   if {"EMER", "RENT"} <= {normalizuj(c.value) for c in w if isinstance(c.value, str)}),
-                  None)
-    if r_nagl is None:
-        return None
-    komorki = [c for c in ws[r_nagl] if isinstance(c.value, str) and c.value.strip()]
-    kol_emer = next(c.column for c in komorki if normalizuj(c.value) == "EMER")
-    naglowki = [(zakres_komorki(ws, r_nagl, c.column), etykieta(c.value))
-                for c in komorki if c.column >= kol_emer]
- 
-    # 2) wiersze szukamy po etykiecie (na lewo od kolumny EMER.) kilka wierszy pod nagłówkami
-    zus = {}
-    for r in range(r_nagl + 1, min(ws.max_row, r_nagl + 10) + 1):
-        kol_et, tekst = pierwszy_tekst(ws, r, 1, kol_emer - 1)
-        if tekst is None or bez_ogonkow(tekst) not in WIERSZE_ZUS:
-            continue
-        liczby = []
-        for k in range(kol_et + 1, ws.max_column + 1):
-            kwota = na_liczbe(ws.cell(r, k).value)
-            if kwota is not None:
-                liczby.append((zakres_komorki(ws, r, k), kwota))
-        zus[etykieta(tekst)] = przypisz_do_naglowkow(liczby, naglowki)
-    return zus or None
- 
- 
-# ----------------------------------------------------------------------- całość
-def wczytaj_pasek(sciezka, arkusz=None):
-    """Słownik z kluczami: skladniki, suma, zakresy, zus."""
-    wb = load_workbook(sciezka, data_only=True)  # data_only: wartości zamiast formuł
-    ws = wb[arkusz] if arkusz else wb.active
-    skladniki, suma, zakresy, wiersz_nagl = wczytaj_skladniki(ws)
-    return {"skladniki": skladniki, "suma": suma, "zakresy": zakresy,
-            "zus": wczytaj_zus(ws, od_wiersza=wiersz_nagl + 1)}
- 
- 
-def kontrola(opis, odczytane, w_arkuszu):
-    ok = abs(odczytane - w_arkuszu) < Decimal("0.005")
-    print(f"Kontrola {opis}: odczytane {zl(odczytane)}, w arkuszu {zl(w_arkuszu)}"
-          f" -> {'OK' if ok else 'RÓŻNICA!'}")
- 
- 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        sys.exit("Użycie: python skladniki_z_excela.py plik.xlsx [nazwa_arkusza]")
-    pasek = wczytaj_pasek(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
-    skladniki, suma, zus = pasek["skladniki"], pasek["suma"], pasek["zus"]
- 
-    # --- składniki płacowe
-    print("Wykryte kolumny: " + ", ".join(
-        f"{s} {get_column_letter(a)}-{get_column_letter(b)}" for s, (a, b) in pasek["zakresy"].items()))
-    print(f"\n{'ELEMENT':<28}{'OPODATKOWANE':>14}{'NIEOPODATKOWANE':>18}")
-    for s in skladniki:
-        print(f"{s['element']:<28}{zl(s['opodatkowane']):>14}{zl(s['nieopodatkowane']):>18}")
-    # suma odczytanych kwot vs wiersz SUMA – różnica = kwota w złej sekcji albo pominięta
-    if suma:
-        print()
-        for sekcja, w_arkuszu in suma.items():
-            if w_arkuszu is not None:
-                kontrola(sekcja, sum((s[sekcja] or 0 for s in skladniki), Decimal(0)), w_arkuszu)
- 
-    # --- składki ZUS (w wydruku kolumny tabeli idą w dół, żeby zmieściło się na ekranie)
-    if not zus:
-        print("\nNie znalazłem tabeli składek (wiersza z EMER. i RENT.).")
-    else:
-        wiersze = list(zus)
-        print(f"\n{'SKŁADKI ZUS':<18}" + "".join(f"{w:>13}" for w in wiersze))
-        for kol in zus[wiersze[0]]:
-            print(f"{kol:<18}" + "".join(f"{zl(zus[w][kol]):>13}" for w in wiersze))
-        # RAZEM SKŁ. ZUS powinno równać się sumie kolumn na lewo od niego
-        print()
-        for w, wartosci in zus.items():
-            nazwy = list(wartosci)
-            razem = next((n for n in nazwy if normalizuj(n).startswith("RAZEM")), None)
-            if razem and wartosci[razem] is not None:
-                skladowe = nazwy[:nazwy.index(razem)]
-                kontrola(f"{w} ({razem})",
-                         sum((wartosci[n] or 0 for n in skladowe), Decimal(0)), wartosci[razem])
+def wczytaj_pola(ws):
+    """{'PRACOWNIK': 'Jan Kowalski', 'PESEL': '...', 'PODST. ZDROW': Decimal, ...};
+    pole, którego nie znaleziono, ma wartość None."""
+    pola = {}
+    for nazwa, gdzie in POLA_TEKSTU.items():
+        wartosc = pole_tekstowe(ws, nazwa, gdzie)
+        if nazwa == "PESEL" and wartosc and wartosc.isdigit():
+            wartosc = wartosc.zfill(11)  # PESEL zapisany jako liczba gubi zero z przodu
+        pola[etykieta(nazwa)] = wartosc
+    for nazwa in POLA_KWOT:
+        komorka, w_komorce = znajdz_etykiete(ws, nazwa)
+        if komorka is None:
+            wartosc = None
+        else:
+            wartosc = na_liczbe(w_komorce) if w_komorce else kwota_obok(ws, komorka.row, komorka.column)
+        pola[etykieta(nazwa)] = wartosc
+    return pola
  
