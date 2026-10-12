@@ -1,0 +1,149 @@
+"""
+Wczytuje składniki płacowe z arkusza Excel w układzie:
+
+    NAZWA ELEMENTU   |  OPODATKOWANE  | NIEOPODATKOWANE
+    wynagr.zasad./g  |  5 280,00      |
+    wynagr.url.      |        609,32  |
+
+Kwota zawsze stoi w tym samym wierszu co nazwa, ale bywa w różnych kolumnach
+w obrębie ramki sekcji – dlatego każda sekcja to ZAKRES kolumn, a nie jedna kolumna.
+
+Użycie:  python skladniki_z_excela.py plik.xlsx [nazwa_arkusza]
+Wymaga:  pip install openpyxl   (plik .xls najpierw zapisz jako .xlsx)
+"""
+import re
+import sys
+from decimal import Decimal
+
+from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
+
+# Gdyby automatyczne wykrywanie kolumn zawiodło, wpisz zakresy ręcznie, np.:
+# RECZNE_ZAKRESY = {"opodatkowane": ("G", "J"), "nieopodatkowane": ("K", "N")}
+RECZNE_ZAKRESY = None
+
+# Wiersz bez nazwy albo zaczynający się od tych słów kończy listę składników
+SLOWA_KONCZACE = ("RAZEM", "SUMA", "OGÓŁEM", "ŁĄCZNIE")
+
+
+def normalizuj(tekst):
+    """'Nieopodatkowane:' -> 'NIEOPODATKOWANE' (same wielkie litery)."""
+    return re.sub(r"[^A-ZĄĆĘŁŃÓŚŹŻ]", "", str(tekst).upper())
+
+
+def na_liczbe(wartosc):
+    """609.32 / '5 280,00' / '1.234,56 zł' -> Decimal, wszystko inne -> None."""
+    if wartosc is None or isinstance(wartosc, bool):
+        return None
+    if isinstance(wartosc, (int, float)):
+        return Decimal(str(wartosc))
+    if isinstance(wartosc, str):
+        # \s usuwa też twardą spację, którą programy płacowe wstawiają między tysiące
+        s = re.sub(r"\s|zł|pln", "", wartosc, flags=re.IGNORECASE)
+        if "," in s:  # zapis polski: kropka = tysiące, przecinek = grosze
+            s = s.replace(".", "").replace(",", ".")
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            return Decimal(s)
+    return None
+
+
+def znajdz_naglowek(ws):
+    """Zwraca (nr_wiersza, {NAGŁÓWEK: nr_kolumny}) dla wiersza z nagłówkami sekcji."""
+    for wiersz in ws.iter_rows(max_row=min(ws.max_row, 200)):
+        naglowki = {normalizuj(c.value): c.column
+                    for c in wiersz if isinstance(c.value, str) and c.value.strip()}
+        # porównanie dokładne, bo 'NIEOPODATKOWANE' zawiera w sobie 'OPODATKOWANE'
+        if "OPODATKOWANE" in naglowki and "NIEOPODATKOWANE" in naglowki:
+            return wiersz[0].row, naglowki
+    raise ValueError("Nie znalazłem wiersza z nagłówkami OPODATKOWANE i NIEOPODATKOWANE.")
+
+
+def poczatek_ramki(ws, wiersz, kol, granica):
+    """Napis nagłówka nie zawsze stoi w pierwszej kolumnie swojej ramki, więc cofamy się
+    w lewo do najbliższego pionowego obramowania (ale nie dalej niż do kolumny `granica`)."""
+    for k in range(kol, granica, -1):
+        # strona obramowania bywa None (komórka ma np. tylko lewą krawędź), stąd getattr
+        lewa = getattr(ws.cell(wiersz, k).border.left, "style", None)
+        prawa_sasiada = getattr(ws.cell(wiersz, k - 1).border.right, "style", None) if k > 1 else None
+        if lewa or prawa_sasiada:
+            return k
+    return kol  # brak obramowań – sekcja zaczyna się w kolumnie nagłówka
+
+
+def wykryj_zakresy(ws, wiersz, naglowki):
+    """{sekcja: (od_kolumny, do_kolumny)} – numery kolumn liczone od 1."""
+    if RECZNE_ZAKRESY:
+        return {s: (column_index_from_string(a), column_index_from_string(b))
+                for s, (a, b) in RECZNE_ZAKRESY.items()}
+    k_nazwa = naglowki.get("NAZWAELEMENTU", 1)
+    k_opod, k_nieop = naglowki["OPODATKOWANE"], naglowki["NIEOPODATKOWANE"]
+    od_opod = poczatek_ramki(ws, wiersz, k_opod, k_nazwa)
+    od_nieop = poczatek_ramki(ws, wiersz, k_nieop, k_opod)
+    # NIEOPODATKOWANE sięga do następnego nagłówka po prawej albo do końca arkusza
+    dalej = [k for k in naglowki.values() if k > k_nieop]
+    do_nieop = poczatek_ramki(ws, wiersz, min(dalej), k_nieop) - 1 if dalej else ws.max_column
+    return {"opodatkowane": (od_opod, od_nieop - 1), "nieopodatkowane": (od_nieop, do_nieop)}
+
+
+def pierwsza_liczba(ws, wiersz, od_kol, do_kol):
+    """Pierwsza liczba w wierszu w danym zakresie kolumn – obojętnie, w której kolumnie stoi."""
+    for k in range(od_kol, do_kol + 1):
+        liczba = na_liczbe(ws.cell(wiersz, k).value)
+        if liczba is not None:
+            return liczba
+    return None
+
+
+def wczytaj_skladniki(sciezka, arkusz=None):
+    """Zwraca (skladniki, wiersz_sumy, zakresy), gdzie skladniki to lista słowników:
+    {'element': 'wynagr.url.', 'opodatkowane': Decimal('609.32'), 'nieopodatkowane': None}"""
+    wb = load_workbook(sciezka, data_only=True)  # data_only: wartości zamiast formuł
+    ws = wb[arkusz] if arkusz else wb.active
+    wiersz_nagl, naglowki = znajdz_naglowek(ws)
+    zakresy = wykryj_zakresy(ws, wiersz_nagl, naglowki)
+    od_opod = zakresy["opodatkowane"][0]
+
+    skladniki, suma = [], None
+    for r in range(wiersz_nagl + 1, ws.max_row + 1):
+        # nazwa = pierwszy tekst (nie liczba) na lewo od sekcji OPODATKOWANE
+        komorki = (ws.cell(r, k).value for k in range(1, od_opod))
+        nazwa = next((str(v).strip() for v in komorki
+                      if v is not None and str(v).strip() and na_liczbe(v) is None), None)
+        kwoty = {s: pierwsza_liczba(ws, r, od, do) for s, (od, do) in zakresy.items()}
+        sa_kwoty = any(v is not None for v in kwoty.values())
+
+        if nazwa is None and not sa_kwoty and not skladniki:
+            continue  # puste wiersze tuż pod nagłówkiem
+        if nazwa is None or normalizuj(nazwa).startswith(SLOWA_KONCZACE):
+            suma = kwoty if sa_kwoty else None  # wiersz sumy – przyda się do kontroli
+            break
+        skladniki.append({"element": nazwa, **kwoty})
+    return skladniki, suma, zakresy
+
+
+def zl(kwota):
+    """Decimal('5280') -> '5 280,00'"""
+    return "" if kwota is None else f"{kwota:,.2f}".replace(",", " ").replace(".", ",")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit("Użycie: python skladniki_z_excela.py plik.xlsx [nazwa_arkusza]")
+    skladniki, suma, zakresy = wczytaj_skladniki(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+
+    print("Wykryte kolumny: " + ", ".join(
+        f"{s} {get_column_letter(a)}-{get_column_letter(b)}" for s, (a, b) in zakresy.items()))
+    print(f"\n{'ELEMENT':<28}{'OPODATKOWANE':>14}{'NIEOPODATKOWANE':>18}")
+    for s in skladniki:
+        print(f"{s['element']:<28}{zl(s['opodatkowane']):>14}{zl(s['nieopodatkowane']):>18}")
+
+    # Kontrola z wierszem sumy pod listą (jeśli jest): różnica oznacza, że jakaś
+    # kwota trafiła do złej sekcji albo została pominięta.
+    if suma:
+        print()
+        for sekcja, z_arkusza in suma.items():
+            if z_arkusza is not None:
+                policzone = sum((s[sekcja] or 0 for s in skladniki), Decimal(0))
+                ok = abs(policzone - z_arkusza) < Decimal("0.005")
+                print(f"Kontrola {sekcja}: odczytane {zl(policzone)}, suma w arkuszu {zl(z_arkusza)}"
+                      f" -> {'OK' if ok else 'RÓŻNICA!'}")
