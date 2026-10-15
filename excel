@@ -1,119 +1,486 @@
-POLA_KWOT = ("PODST. ZDROW.", "ZDROW.", "ZAL. POD.", "KOSZTY", "ULGA POD.", "GOT", "ROR")
-POLA_TEKSTU = {"PRACOWNIK": "w_komorce", "PESEL": "obok"}
+#!/usr/bin/env python3
+"""
+lista_plac.py - wyciąga składniki wynagrodzenia z listy płac zapisanej w Excelu
+(układ: LP | PRACOWNIK [AKRONIM] | EL. WYPLATY | WARTOSC: OPODAT. / NIEOPOD. | ...)
+i zwraca pandas.DataFrame z trzema kolumnami:
 
-def pole_tekstowe(ws, nazwa, gdzie):
-    cel = bez_ogonkow(nazwa)
-    for (c,) in ws.iter_rows(min_col=1, max_col=1):        # tylko kolumna A
-        tekst = c.value.strip() if isinstance(c.value, str) else ""
-        if not tekst or not bez_ogonkow(tekst).startswith(cel):
-            continue                                        # to nie ta etykieta
-        _, dwukropek, po = tekst.partition(":")             # 'Pracownik: Jan' -> 'Jan'
-        if not dwukropek:                                   # bez dwukropka: odetnij pierwsze słowo
-            po = tekst.split(None, 1)[1] if len(tekst.split(None, 1)) > 1 else ""
-        if po.strip():
-            return po.strip()                               # wartość była w komórce
-        return tekst_obok(ws, c.row, c.column) if gdzie == "obok" else None
-    return None                                             # etykiety nie ma w kolumnie A
+    Pracownik   Nazwa składnika        Wartość składnika
+    Adamiak     wynagr.url. opodat.               609.32
+
+W kodzie / Jupyterze:
+    from lista_plac import wczytaj_liste_plac
+    df = wczytaj_liste_plac("lista_plac.xlsx")
+
+Z wiersza poleceń:
+    python lista_plac.py lista_plac.xlsx                  # podgląd w konsoli
+    python lista_plac.py lista_plac.xlsx -o wynik.xlsx    # zapis do .xlsx albo .csv
+
+Jak to działa:
+  * kolumny są szukane po nagłówkach (LP, PRACOWNIK, EL. WYPLATY, OPODAT., NIEOPOD.),
+    więc przesunięcie tabeli w arkuszu niczego nie psuje;
+  * czytane są wszystkie arkusze po kolei (Sheet1, Sheet2, ...); jeśli blok pracownika
+    przechodzi na następny arkusz, jest kontynuowany;
+  * kwoty mogą być liczbami albo tekstem ("5 280,00" z zieloną flagą w Excelu);
+  * wiersz "Podsumowanie:" zamyka blok pracownika - skrypt sprawdza, czy suma
+    odczytanych składników zgadza się z tym wierszem, i wypisuje UWAGĘ, jeśli nie.
+
+Wymaga: pandas, openpyxl (pliki .xls dodatkowo: xlrd).
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import unicodedata
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pandas as pd
+
+# ---------------------------------------------------------------- ustawienia
+
+KOLUMNY = ["Pracownik", "Nazwa składnika", "Wartość składnika"]
+
+# Dopisek do nazwy składnika - zależy od kolumny, z której pochodzi kwota.
+DOPISEK = {"opodat": "opodat.", "nieopod": "nieopod."}
+
+# Nazwa pracownika w wyniku. Pola: {nazwisko}, {imie}, {akronim}, {lp}
+# np. "{nazwisko} {imie}" albo "{nazwisko} [{akronim}]"
+FORMAT_PRACOWNIKA = "{nazwisko}"
+
+# Nagłówki tabeli -> pole. Porównanie bez polskich znaków, kropek, spacji i wielkości liter.
+NAGLOWKI = {
+    "LP": "lp",
+    "PRACOWNIKAKRONIM": "pracownik",
+    "PRACOWNIK": "pracownik",
+    "ELWYPLATY": "skladnik",
+    "ELEMENTYWYPLATY": "skladnik",
+    "WARTOSC": "wartosc",
+    "OPODAT": "opodat",
+    "OPODATKOWANE": "opodat",
+    "NIEOPOD": "nieopod",
+    "NIEOPODATKOWANE": "nieopod",
+}
 
 
-for nazwa, gdzie in POLA_TEKSTU.items():
-    wartosc = pole_tekstowe(ws, nazwa, gdzie)
-    if nazwa == "PESEL" and wartosc and wartosc.isdigit():
-        wartosc = wartosc.zfill(11)
-    pola[etykieta(nazwa)] = wartosc
+# ---------------------------------------------------------------- odczyt komórek
+
+def _klucz(tekst: object) -> str:
+    """'EL. WYPŁATY' -> 'ELWYPLATY' (bez polskich znaków, kropek i spacji)."""
+    s = str(tekst).replace("ł", "l").replace("Ł", "L")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(z for z in s if not unicodedata.combining(z))
+    return re.sub(r"[^A-Z0-9]", "", s.upper())
 
 
-def scalenie(ws, wiersz, kol):
-    """(od_wiersza, od_kol, do_wiersza, do_kol) scalenia, do którego należy komórka;
-    dla zwykłej komórki to ona sama."""
-    for z in ws.merged_cells.ranges:
-        if z.min_row <= wiersz <= z.max_row and z.min_col <= kol <= z.max_col:
-            return z.min_row, z.min_col, z.max_row, z.max_col
-    return wiersz, kol, wiersz, kol
+def _tekst(v: object) -> str:
+    """Tekst komórki bez nadmiarowych (także twardych) spacji; liczby i puste -> ''."""
+    if not isinstance(v, str):
+        return ""
+    linie = (" ".join(linia.split()) for linia in v.splitlines())
+    return "\n".join(linia for linia in linie if linia)
 
 
-def zakres_komorki(ws, wiersz, kol):
-    """(od_kol, do_kol) – dla komórki scalonej cały jej zakres, dla zwykłej (kol, kol)."""
-    _, od_kol, _, do_kol = scalenie(ws, wiersz, kol)
-    return od_kol, do_kol
+_KWOTA = re.compile(r"[+-]?\d+(?:\.\d+)?")
 
 
-
-# -------------------------------------------- część 3: pola „etykieta -> wartość”
-def znajdz_etykiete(ws, nazwa):
-    """(komórka, wartość_z_tej_samej_komórki) dla etykiety, np. 'ZAL. POD.' albo
-    'Pracownik: Jan Kowalski' (wtedy wartość to tekst po dwukropku). Brak -> (None, None)."""
-    cel = bez_ogonkow(nazwa)
-    for wiersz in ws.iter_rows():
-        for c in wiersz:
-            if not isinstance(c.value, str):
-                continue
-            przed, _, po = c.value.partition(":")
-            if po.strip() and bez_ogonkow(przed) == cel:
-                return c, po.strip()
-            if bez_ogonkow(c.value) == cel:  # dokładnie: 'ZDROW.' nie złapie 'PODST. ZDROW.'
-                return c, None
-    return None, None
- 
- 
-def jest_etykieta(v):
-    """Tekst, który nie jest liczbą (np. 'KOSZTY') – początek pola sąsiada."""
-    return v is not None and str(v).strip() != "" and na_liczbe(v) is None 
-def kwota_obok(ws, r, k):
-    """Pierwsza liczba na prawo od etykiety w tym samym wierszu, ale przed następną
-    etykietą – dalej są już kwoty innego pola (ZDROW. w J17 -> kwota w M17).
-    Gdy etykieta jest scalona w pionie (np. J17:J18), sprawdza każdy jej wiersz."""
-    od_w, _, do_w, _ = scalenie(ws, r, k)
-    for rr in range(od_w, do_w + 1):
-        for kk in range(k + 1, ws.max_column + 1):
-            v = ws.cell(rr, kk).value
-            kwota = na_liczbe(v)
-            if kwota is not None:
-                return kwota
-            if jest_etykieta(v):
-                break
-    return None
-def tekst_obok(ws, r, k):
-    """Pierwsza niepusta komórka na prawo od etykiety, jako tekst. Tekst zakończony
-    dwukropkiem to już następna etykieta (np. 'Tytuł ubezpieczenia:') – wtedy None."""
-    for kk in range(k + 1, ws.max_column + 1):
-        v = ws.cell(r, kk).value
-        if v is not None and str(v).strip():
-            if isinstance(v, float) and v.is_integer():
-                v = int(v)
-            tekst = str(v).strip()
-            return None if tekst.endswith(":") else tekst
-    return None
-def pole_tekstowe(ws, nazwa, gdzie):
-    """Szuka etykiety tylko w kolumnie A. Wartość to tekst po etykiecie w tej samej
-    komórce ('Pracownik: Jan Kowalski' -> 'Jan Kowalski'); dla pól "obok", gdy w komórce
-    jest sama etykieta, bierze pierwszą komórkę na prawo."""
-    cel = bez_ogonkow(nazwa)
-    for (c,) in ws.iter_rows(min_col=1, max_col=1):
-        tekst = c.value.strip() if isinstance(c.value, str) else ""
-        if not tekst or not bez_ogonkow(tekst).startswith(cel):
-            continue
-        _, dwukropek, po = tekst.partition(":")
-        if not dwukropek:  # bez dwukropka: 'PRACOWNIK Jan Kowalski' – odcinamy pierwsze słowo
-            po = tekst.split(None, 1)[1] if len(tekst.split(None, 1)) > 1 else ""
-        if po.strip():
-            return po.strip()
-        return tekst_obok(ws, c.row, c.column) if gdzie == "obok" else None
-    return None
-def wczytaj_pola(ws):
-    """{'PRACOWNIK': 'Jan Kowalski', 'PESEL': '...', 'PODST. ZDROW': Decimal, ...};
-    pole, którego nie znaleziono, ma wartość None."""
-    pola = {}
-    for nazwa, gdzie in POLA_TEKSTU.items():
-        wartosc = pole_tekstowe(ws, nazwa, gdzie)
-        if nazwa == "PESEL" and wartosc and wartosc.isdigit():
-            wartosc = wartosc.zfill(11)  # PESEL zapisany jako liczba gubi zero z przodu
-        pola[etykieta(nazwa)] = wartosc
-    for nazwa in POLA_KWOT:
-        komorka, w_komorce = znajdz_etykiete(ws, nazwa)
-        if komorka is None:
-            wartosc = None
+def _liczba(v: object) -> float | None:
+    """Kwota z komórki: liczba albo tekst typu '5 280,00', '-72', '1.234,56', '(72,00)'."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return None if v != v else float(v)              # NaN -> None
+    if not isinstance(v, str):
+        return None                                       # daty itp. to nie kwoty
+    s = "".join(v.split()).replace("−", "-")         # bez spacji (też twardych)
+    s = re.sub(r"(?i)(zł|pln)$", "", s)
+    ujemna = s.startswith("(") and s.endswith(")")
+    if ujemna:
+        s = s[1:-1]
+    if "," in s and "." in s:                             # 1.234,56 albo 1,234.56
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
         else:
-            wartosc = na_liczbe(w_komorce) if w_komorce else kwota_obok(ws, komorka.row, komorka.column)
-        pola[etykieta(nazwa)] = wartosc
-    return pola
+            s = s.replace(",", "")
+    elif s.count(",") == 1:                               # 609,32
+        s = s.replace(",", ".")
+    elif re.fullmatch(r"[+-]?\d{1,3}(?:\.\d{3})+", s):    # 1.234.567 - kropki jako tysiące
+        s = s.replace(".", "")
+    if not _KWOTA.fullmatch(s):
+        return None
+    return -float(s) if ujemna else float(s)
+
+
+def _lp(v: object) -> int | None:
+    """Liczba porządkowa z kolumny LP: 1, 1.0, '1', '1.'."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and v == v and float(v).is_integer() and v > 0:
+        return int(v)
+    if isinstance(v, str):
+        m = re.fullmatch(r"\s*(\d+)\.?\s*", v)
+        if m and int(m[1]) > 0:
+            return int(m[1])
+    return None
+
+
+_NAZWISKO_AKRONIM = re.compile(r"(?P<nazwisko>.*?)\s*\[(?P<akronim>[^\]]*)\]")
+
+
+def _rozbierz_pracownika(tekst: str) -> tuple[str, str, str]:
+    """'Adamiak [0034]' (imię ewentualnie w drugiej linii) -> (nazwisko, akronim, imię)."""
+    pierwsza, *reszta = tekst.splitlines()
+    m = _NAZWISKO_AKRONIM.fullmatch(pierwsza)
+    if m:
+        return m["nazwisko"], m["akronim"].strip(), " ".join(reszta)
+    return pierwsza, "", " ".join(reszta)
+
+
+def _teksty(wiersz: list, zakres: range) -> list[str]:
+    """Niepuste teksty z podanych kolumn wiersza."""
+    return [t for t in (_tekst(wiersz[c]) for c in zakres if c < len(wiersz)) if t]
+
+
+def _pierwsza(funkcja, wiersz: list, zakres: range):
+    """Pierwsza wartość w podanych kolumnach, którą funkcja rozpoznaje (kwota, LP)."""
+    for c in zakres:
+        if c < len(wiersz):
+            x = funkcja(wiersz[c])
+            if x is not None:
+                return x
+    return None
+
+
+# ---------------------------------------------------------------- pliki i nagłówek
+
+def _wczytaj_arkusze(sciezka: Path) -> list[tuple[str, list[list]]]:
+    """[(nazwa arkusza, wiersze)], wiersze to listy wartości komórek, licząc od A1."""
+    if sciezka.suffix.lower() == ".xls":
+        try:
+            import xlrd
+        except ImportError:
+            raise ImportError("Do plików .xls potrzebny jest pakiet xlrd (pip install xlrd) "
+                              "albo zapisz plik jako .xlsx.") from None
+        wynik = []
+        for ark in xlrd.open_workbook(str(sciezka)).sheets():
+            wiersze = [[k.value if k.ctype in (xlrd.XL_CELL_TEXT, xlrd.XL_CELL_NUMBER) else None
+                        for k in ark.row(r)] for r in range(ark.nrows)]
+            wynik.append((ark.name, wiersze))
+        return wynik
+
+    from openpyxl import load_workbook
+    with warnings.catch_warnings():                 # ostrzeżenia o stylach są tu bez znaczenia
+        warnings.simplefilter("ignore")
+        ksiazka = load_workbook(sciezka, data_only=True)
+    return [(ark.title, [list(w) for w in ark.iter_rows(values_only=True)])
+            for ark in ksiazka.worksheets]
+
+
+@dataclass
+class _Uklad:
+    """Zakresy kolumn (numery od 0) potrzebnych pól tabeli; brak pola = pusty zakres."""
+    lp: range
+    pracownik: range
+    skladnik: range
+    opodat: range
+    nieopod: range
+
+
+def _znajdz_naglowek(wiersze: list[list]) -> tuple[_Uklad | None, set[int], int]:
+    """Szuka nagłówka tabeli w arkuszu.
+
+    Zwraca: układ kolumn (albo None), numery wierszy z nagłówkami (pomijane przy czytaniu
+    danych - nagłówek bywa powtórzony) i numer ostatniego wiersza pierwszego nagłówka.
+    """
+    pierwsze: dict[str, tuple[int, int]] = {}
+    wiersze_naglowka: set[int] = set()
+    for r, wiersz in enumerate(wiersze):
+        for c, v in enumerate(wiersz):
+            pole = NAGLOWKI.get(_klucz(v)) if isinstance(v, str) else None
+            if pole:
+                wiersze_naglowka.add(r)
+                pierwsze.setdefault(pole, (r, c))
+    if not {"pracownik", "skladnik", "opodat"} <= pierwsze.keys():
+        return None, wiersze_naglowka, -1
+
+    od = min(r for r, _ in pierwsze.values())
+    do = max(r for r, _ in pierwsze.values())
+    # Każda niepusta komórka nagłówka zaczyna jakąś kolumnę tabeli; pole sięga do
+    # kolumny przed następnym nagłówkiem (działa też przy scalonych komórkach).
+    poczatki = sorted({c for r in range(od, do + 1)
+                       for c, v in enumerate(wiersze[r]) if v is not None and str(v).strip()})
+
+    def zakres(pole: str) -> range:
+        if pole not in pierwsze:
+            return range(0)
+        c = pierwsze[pole][1]
+        dalej = [p for p in poczatki if p > c]
+        return range(c, dalej[0] if dalej else c + 1)
+
+    uklad = _Uklad(*(zakres(p) for p in ("lp", "pracownik", "skladnik", "opodat", "nieopod")))
+    return uklad, wiersze_naglowka, do
+
+
+# ---------------------------------------------------------------- czytanie bloków
+
+@dataclass
+class _Pracownik:
+    lp: int | None
+    nazwisko: str
+    akronim: str
+    imie: str
+    arkusz: str
+    gdzie: str                                       # np. "Sheet1!6" - do komunikatów
+    skladniki: list = field(default_factory=list)    # (nazwa, "opodat"/"nieopod", kwota)
+    zamkniety: bool = False                          # po wierszu "Podsumowanie:"
+
+
+class _Czytnik:
+    """Przechodzi wiersz po wierszu przez wszystkie arkusze i zbiera bloki pracowników."""
+
+    def __init__(self) -> None:
+        self.pracownicy: list[_Pracownik] = []
+        self.uwagi: list[str] = []
+        self.poza_blokiem: list[tuple[str, int]] = []   # składniki nieprzypisane nikomu
+        self.biezacy: _Pracownik | None = None
+        self.polowka: dict | None = None             # wiersz z samą nazwą albo samą kwotą
+
+    @property
+    def otwarty(self) -> bool:
+        return self.biezacy is not None and not self.biezacy.zamkniety
+
+    def wiersz(self, wiersz: list, uklad: _Uklad, arkusz: str, nr: int) -> None:
+        gdzie = f"{arkusz}!{nr}"
+        lp = _pierwsza(_lp, wiersz, uklad.lp)
+        prac = "\n".join(_teksty(wiersz, uklad.pracownik))
+        nazwa = " ".join(_teksty(wiersz, uklad.skladnik)).replace("\n", " ")
+        op = _pierwsza(_liczba, wiersz, uklad.opodat)
+        nie = _pierwsza(_liczba, wiersz, uklad.nieopod)
+        podsumowanie = any(_klucz(t).startswith("PODSUMOWANIE") for t in (nazwa, prac))
+
+        # 1. Początek bloku nowego pracownika: "1 | Adamiak [0034]"
+        if prac and not podsumowanie and self._to_pracownik(prac, lp):
+            self._zakoncz_blok()
+            nazwisko, akronim, imie = _rozbierz_pracownika(prac)
+            self.biezacy = _Pracownik(lp, nazwisko, akronim, imie, arkusz, gdzie)
+            self.pracownicy.append(self.biezacy)
+        elif prac and not podsumowanie and self.otwarty and not self.biezacy.imie:
+            self.biezacy.imie = prac.splitlines()[0]      # imię w wierszu pod nazwiskiem
+
+        # 2. "Podsumowanie:" - kontrola sum i koniec składników tego pracownika
+        if podsumowanie:
+            if self.otwarty:
+                self._zostaw_polowke()
+                self._sprawdz_sumy(op, nie, gdzie)
+                self.biezacy.zamkniety = True
+            return
+
+        # 3. Składnik
+        if not nazwa and op is None and nie is None:
+            return
+        if not self.otwarty:
+            if nazwa and (op is not None or nie is not None):
+                self.poza_blokiem.append((arkusz, nr))
+            return
+        if nazwa and (op is not None or nie is not None):
+            self._zostaw_polowke()
+            self._dodaj(nazwa, op, nie)
+            return
+
+        # Sama nazwa albo sama kwota - kwota bywa przesunięta o wiersz, łączymy w parę.
+        p = self.polowka
+        sasiad = p is not None and p["arkusz"] == arkusz and nr - p["nr"] <= 2
+        if sasiad and p["nazwa"] and not nazwa:           # nazwa wyżej, kwota tutaj
+            self._dodaj(p["nazwa"], op, nie)
+            self.polowka = None
+        elif sasiad and nazwa and not p["nazwa"]:         # kwota wyżej, nazwa tutaj
+            self._dodaj(nazwa, p["op"], p["nie"])
+            self.polowka = None
+        else:
+            self._zostaw_polowke()
+            self.polowka = {"nazwa": nazwa, "op": op, "nie": nie,
+                            "arkusz": arkusz, "nr": nr, "gdzie": gdzie}
+
+    def koniec(self) -> None:
+        self._zakoncz_blok()
+
+    # --- pomocnicze
+
+    @staticmethod
+    def _to_pracownik(prac: str, lp: int | None) -> bool:
+        pierwsza = prac.splitlines()[0]
+        k = _klucz(pierwsza)
+        if k in NAGLOWKI or k.startswith(("RAZEM", "SUMA", "PODSUMOWANIE")):
+            return False
+        return lp is not None or _NAZWISKO_AKRONIM.fullmatch(pierwsza) is not None
+
+    def _dodaj(self, nazwa: str, op: float | None, nie: float | None) -> None:
+        if op is not None:
+            self.biezacy.skladniki.append((nazwa, "opodat", op))
+        if nie is not None:
+            self.biezacy.skladniki.append((nazwa, "nieopod", nie))
+
+    def _zostaw_polowke(self) -> None:
+        p = self.polowka
+        if p:
+            co = f"składnik '{p['nazwa']}' bez kwoty" if p["nazwa"] else "kwota bez nazwy składnika"
+            kto = self.biezacy.nazwisko if self.biezacy else "?"
+            self.uwagi.append(f"{p['gdzie']} {kto}: {co} - pominięto")
+        self.polowka = None
+
+    def _zakoncz_blok(self) -> None:
+        self._zostaw_polowke()
+        b = self.biezacy
+        if b is not None and not b.zamkniety:
+            self.uwagi.append(f"{b.gdzie} {b.nazwisko}: brak wiersza 'Podsumowanie:' - "
+                              f"sum nie sprawdzono")
+            b.zamkniety = True
+
+    def _sprawdz_sumy(self, op: float | None, nie: float | None, gdzie: str) -> None:
+        b = self.biezacy
+        for typ, z_podsumowania in (("opodat", op), ("nieopod", nie)):
+            if z_podsumowania is None:
+                continue
+            suma = sum(k for _, t, k in b.skladniki if t == typ)
+            if abs(suma - z_podsumowania) > 0.005:
+                self.uwagi.append(
+                    f"{gdzie} {b.nazwisko}: składniki {DOPISEK[typ]} sumują się do {suma:.2f}, "
+                    f"a 'Podsumowanie' pokazuje {z_podsumowania:.2f}")
+
+
+def _skrot_miejsc(miejsca: list[tuple[str, int]]) -> str:
+    """[('Sheet2', 26), ('Sheet3', 14), ('Sheet3', 15), ('Sheet3', 16)] -> 'Sheet2!26; Sheet3!14–16'."""
+    grupy: list[tuple[str, list[int]]] = []
+    for arkusz, nr in miejsca:
+        if not grupy or grupy[-1][0] != arkusz:
+            grupy.append((arkusz, []))
+        grupy[-1][1].append(nr)
+    czesci = []
+    for arkusz, nry in grupy:
+        zakresy = [[nry[0], nry[0]]]
+        for nr in nry[1:]:
+            if nr - zakresy[-1][1] <= 2:          # scalone wiersze dają małe przerwy
+                zakresy[-1][1] = nr
+            else:
+                zakresy.append([nr, nr])
+        czesci.append(f"{arkusz}!" + ", ".join(f"{a}–{b}" if a != b else f"{a}" for a, b in zakresy))
+    return "; ".join(czesci)
+
+
+# ---------------------------------------------------------------- funkcja główna
+
+def wczytaj_liste_plac(
+    sciezka: str | Path,
+    format_pracownika: str = FORMAT_PRACOWNIKA,
+    dodaj_arkusz: bool = False,
+    pokaz_uwagi: bool = True,
+) -> pd.DataFrame:
+    """Czyta listę płac z Excela -> DataFrame: Pracownik | Nazwa składnika | Wartość składnika.
+
+    format_pracownika - np. "{nazwisko}", "{nazwisko} {imie}", "{nazwisko} [{akronim}]"
+    dodaj_arkusz      - dodatkowa kolumna "Arkusz" (gdy każdy arkusz to osobna lista płac)
+    pokaz_uwagi       - wypisz uwagi (niezgodne sumy, pominięte wiersze);
+                        są też zawsze w df.attrs["uwagi"]
+    """
+    czytnik = _Czytnik()
+    uklad: _Uklad | None = None
+    for arkusz, wiersze in _wczytaj_arkusze(Path(sciezka)):
+        nowy, wiersze_naglowka, koniec_naglowka = _znajdz_naglowek(wiersze)
+        if nowy is not None:
+            uklad = nowy
+        elif uklad is None:
+            continue                  # arkusz przed tabelą albo bez tabeli
+        for r in range(koniec_naglowka + 1, len(wiersze)):
+            if r not in wiersze_naglowka:
+                czytnik.wiersz(wiersze[r], uklad, arkusz, r + 1)
+    if uklad is None:
+        raise ValueError(f"Nie znaleziono nagłówka listy płac (PRACOWNIK, EL. WYPLATY, OPODAT.) "
+                         f"w pliku {sciezka}")
+    czytnik.koniec()
+
+    pracownicy, uwagi = czytnik.pracownicy, czytnik.uwagi
+
+    def nazwa(p: _Pracownik) -> str:
+        return format_pracownika.format(nazwisko=p.nazwisko, imie=p.imie, akronim=p.akronim,
+                                        lp="" if p.lp is None else p.lp).strip()
+
+    # --- kontrole kompletności
+    poprzednie = None
+    for p in pracownicy:
+        if not p.skladniki:
+            uwagi.append(f"{p.gdzie} {p.nazwisko}: nie znaleziono żadnych składników")
+        if p.lp is not None:
+            oczekiwane = 1 if poprzednie is None else poprzednie + 1
+            if p.lp not in (1, oczekiwane):
+                uwagi.append(f"{p.gdzie} {p.nazwisko}: LP {p.lp}, a oczekiwano {oczekiwane} - "
+                             f"czy nie brakuje pracownika?")
+            poprzednie = p.lp
+    kolejne_listy = [p.gdzie for p in pracownicy[1:] if p.lp == 1]
+    if kolejne_listy and not dodaj_arkusz:
+        uwagi.append(f"LP zaczyna się od 1 ponownie ({', '.join(kolejne_listy[:3])}) - w pliku jest "
+                     f"chyba kilka list; dodaj_arkusz=True (--arkusz) doda kolumnę z arkuszem")
+    osoby: dict[str, set[str]] = {}
+    for p in pracownicy:
+        osoby.setdefault(nazwa(p), set()).add(p.akronim or f"{p.nazwisko} {p.imie}")
+    for n, kto in osoby.items():
+        if len(kto) > 1:
+            uwagi.append(f"'{n}' to {len(kto)} różne osoby ({', '.join(sorted(kto))}) - użyj np. "
+                         f"format_pracownika='{{nazwisko}} {{imie}}'")
+    if czytnik.poza_blokiem:
+        uwagi.append(f"pominięto {len(czytnik.poza_blokiem)} wierszy ze składnikami poza blokami "
+                     f"pracowników (zwykle to podsumowanie całej listy): "
+                     f"{_skrot_miejsc(czytnik.poza_blokiem)}")
+
+    # --- wynik
+    rekordy = []
+    for p in pracownicy:
+        kto = nazwa(p)
+        for skladnik, typ, kwota in p.skladniki:
+            rekord = [kto, f"{skladnik} {DOPISEK[typ]}", round(kwota, 2)]
+            rekordy.append([p.arkusz, *rekord] if dodaj_arkusz else rekord)
+    df = pd.DataFrame(rekordy, columns=(["Arkusz"] if dodaj_arkusz else []) + KOLUMNY)
+    df["Wartość składnika"] = df["Wartość składnika"].astype(float)
+    df.attrs["uwagi"] = uwagi
+    df.attrs["pracownikow"] = len(pracownicy)
+    if pokaz_uwagi:
+        for u in uwagi:
+            print("UWAGA:", u, file=sys.stderr)
+    return df
+
+
+def zapisz(df: pd.DataFrame, sciezka: str | Path) -> None:
+    """Zapis do .xlsx albo .csv (CSV ze średnikiem i przecinkiem - dla polskiego Excela)."""
+    sciezka = Path(sciezka)
+    if sciezka.suffix.lower() == ".csv":
+        df.to_csv(sciezka, index=False, sep=";", decimal=",", float_format="%.2f",
+                  encoding="utf-8-sig")
+    else:
+        df.to_excel(sciezka, index=False)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Wyciąga składniki wynagrodzeń z listy płac (Excel) do tabeli "
+                    "Pracownik | Nazwa składnika | Wartość składnika.")
+    parser.add_argument("plik", help="lista płac: .xlsx, .xlsm albo .xls")
+    parser.add_argument("-o", "--wynik", help="zapisz wynik do pliku .xlsx albo .csv")
+    parser.add_argument("--format", default=FORMAT_PRACOWNIKA,
+                        help='nazwa pracownika, np. "{nazwisko} {imie}" '
+                             "(pola: nazwisko, imie, akronim, lp)")
+    parser.add_argument("--arkusz", action="store_true", help="dodaj kolumnę z nazwą arkusza")
+    args = parser.parse_args(argv)
+
+    df = wczytaj_liste_plac(args.plik, format_pracownika=args.format, dodaj_arkusz=args.arkusz)
+    print(f"Pracowników: {df.attrs['pracownikow']}, składników: {len(df)}, "
+          f"uwag: {len(df.attrs['uwagi'])}")
+    if args.wynik:
+        zapisz(df, args.wynik)
+        print(f"Zapisano: {args.wynik}")
+    else:
+        with pd.option_context("display.max_rows", 60, "display.width", 200):
+            print(df)
+
+
+if __name__ == "__main__":
+    main()
