@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-"""
-lista_plac.py - wyciąga składniki wynagrodzenia z listy płac zapisanej w Excelu
-(układ: LP | PRACOWNIK [AKRONIM] | EL. WYPLATY | WARTOSC: OPODAT. / NIEOPOD. | ...)
-i zwraca pandas.DataFrame z trzema kolumnami:
-
-    Pracownik   Nazwa składnika        Wartość składnika
-    Adamiak     wynagr.url. opodat.               609.32
-
-W kodzie / Jupyterze:
-    from lista_plac import wczytaj_liste_plac
-    df = wczytaj_liste_plac("lista_plac.xlsx")
-
-Z wiersza poleceń:
-    python lista_plac.py lista_plac.xlsx                  # podgląd w konsoli
-    python lista_plac.py lista_plac.xlsx -o wynik.xlsx    # zapis do .xlsx albo .csv
-
-Jak to działa:
-  * kolumny są szukane po nagłówkach (LP, PRACOWNIK, EL. WYPLATY, OPODAT., NIEOPOD.),
-    więc przesunięcie tabeli w arkuszu niczego nie psuje;
-  * czytane są wszystkie arkusze po kolei (Sheet1, Sheet2, ...); jeśli blok pracownika
-    przechodzi na następny arkusz, jest kontynuowany;
-  * kwoty mogą być liczbami albo tekstem ("5 280,00" z zieloną flagą w Excelu);
-  * wiersz "Podsumowanie:" zamyka blok pracownika - skrypt sprawdza, czy suma
-    odczytanych składników zgadza się z tym wierszem, i wypisuje UWAGĘ, jeśli nie.
-
-Wymaga: pandas, openpyxl (pliki .xls dodatkowo: xlrd).
-"""
 from __future__ import annotations
 
 import argparse
